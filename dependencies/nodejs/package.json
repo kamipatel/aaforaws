@@ -1,0 +1,11 @@
+{
+  "name": "aajslayers",
+  "version": "1.0.0",
+  "description": "aajslayers dependencies",
+  "author": "Kamlesh Patel",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^0.18.0",
+    "jsforce": "~1.9.3"
+  }
+}

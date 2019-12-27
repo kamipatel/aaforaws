@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 
+  AppAnalytics cloudformation Template  
+
+Parameters:
+  CopyBucket:
+    Type: String
+    Default: Enter path of S3 Copy bucket with folder (excluding s3://) e.g. appanalytics/dailyraw
+  SfdcUserName:
+    Type: String     
+    Default: Enter salesforce username    
+  SfdcPassword:
+    Type: String     
+    Default: Enter salesforce password with security token appended
+  SfdcURL:  
+    Type: String       
+    Default: https://login.salesforce.com    
+    Description: Put your production or sandbox SFDC URL
+  NotificationEmail:
+    Type: String
+    Description: kamlesh.patel@salesforce.com
+  DailyBatchPayload:  
+    Type: String       
+    Default: "{\"AppName\": \"CaseTimer\", \"packages\": \"0331U000000EHq2\", \"IsBatchEvent\": true}"   
+    Description: Change the name of the app and packages
+
+Resources:
+  AAJsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+        LayerName: aa-app-dependencies
+        Description: Dependencies for aa app 
+        ContentUri: dependencies/
+        CompatibleRuntimes:
+          - nodejs8.10
+          - nodejs10.x
+        LicenseInfo: 'MIT'
+        RetentionPolicy: Retain
+
+  ScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "AAScheduledRule"
+      ScheduleExpression: "rate(1 day)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: !GetAtt 
+            - InitiateAARequestFunction
+            - Arn          
+          Input: !Ref DailyBatchPayload
+          Id: AABatchEvent
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref InitiateAARequestFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledRule"
+          - "Arn"  
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+        # For demo. You can remove this and the "Parameters" section above.
+        Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+  StatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: 
+                  - !Ref SNSTopic
+
+  AppAnalyticsDoCopyFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      FunctionName: "AppAnalyticsDoCopyFunction"
+      CodeUri: aa/
+      Handler: aacopyfile.lambdaHandler
+      Runtime: nodejs10.x
+      Timeout: 180
+      MemorySize: 512      
+      Layers:
+        - !Ref AAJsLayer      
+      Environment:
+        Variables:
+          CopyBucket: !Ref CopyBucket  
+      Policies:
+          - AWSLambdaExecute # Managed Policy
+          - AWSLambdaRole
+          - Version: '2012-10-17' # Policy Document
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: 'arn:aws:s3:::aa-daily-original/*'
+  InitiateAARequestFunction:
+    Type: AWS::Serverless::Function 
+    Properties:
+      FunctionName: "InitiateAARequestFunction"
+      CodeUri: aa/
+      Handler: aainitiate.lambdaHandler
+      Runtime: nodejs10.x
+      Timeout: 10
+      Environment:
+        Variables:
+          statemachine_arn: !Ref AAStateMachine
+      Policies:
+          - AWSLambdaExecute # Managed Policy
+          - AWSLambdaRole
+          - Version: '2012-10-17' # Policy Document
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: "*"            
+      Events:
+        AARequestEvent:
+          Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+          Properties:
+            Path: /initiateaa
+            Method: post    
+  SfdcLoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SfdcLoginFunction
+      CodeUri: aa/
+      Handler: sfdclogin.lambdaHandler
+      Runtime: nodejs10.x
+      Layers:
+        - !Ref AAJsLayer      
+      Timeout: 10
+      Environment:
+        Variables:
+          SfdcUserName: !Ref SfdcUserName      
+          SfdcPassword: !Ref SfdcPassword      
+          SfdcURL: !Ref SfdcURL      
+
+  SfdcNewAARequestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SfdcNewAARequestFunction
+      CodeUri: aa/
+      Handler: sfdcnewaarequest.lambdaHandler
+      Runtime: nodejs10.x
+      Timeout: 10
+      Layers:
+        - !Ref AAJsLayer      
+
+  SfdcAARequestStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SfdcAARequestStatusFunction
+      CodeUri: aa/
+      Handler: sfdcaarequeststatus.lambdaHandler
+      Runtime: nodejs10.x
+      Timeout: 10
+      Layers:
+        - !Ref AAJsLayer      
+
+  AAStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "Comment": "Copy AA file to bucket",
+              "StartAt": "SFDCLogin",
+              "States": {                   
+                "SFDCLogin": {
+                  "Type": "Task",
+                  "Resource": "${lambdaSfdcLoginFunctionArn}",
+                  "ResultPath": "$.sfdc",
+                  "Next": "NewAARequest",
+                  "Catch": [ {
+                            "ErrorEquals": [ "LoginError",  "States.TaskFailed" ],
+                              "Next": "PublishSNS"
+                          } ]                  
+                },
+                "NewAARequest": {
+                  "Type": "Task",
+                  "Resource": "${lambdaAANewRequestArn}",
+                  "ResultPath": "$.aareq",
+                  "Next": "WaitBeforePoll",
+                  "Catch": [ {"ErrorEquals": [ "NewAARequestError",  "States.TaskFailed" ],
+                                          "Next": "PublishSNS"} ]         
+                },
+                "WaitBeforePoll": {
+                  "Type": "Wait",
+                  "Seconds": 240,
+                  "Next": "PollAARequest"
+                },       
+                "PollAARequest": {
+                  "Type": "Task",
+                  "Resource": "${lambdaAAStatusArn}",
+                  "ResultPath": "$.aarecord",
+                  "Next": "StatusCheck",
+                  "Catch": [ {"ErrorEquals": [ "PollAARequestError",  "States.TaskFailed" ],
+                                          "Next": "PublishSNS"} ]               
+                },
+                "StatusCheck": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Not": {
+                        "Variable": "$.aarecord.res[0].RequestState",
+                        "StringEquals": "Complete"
+                      },
+                      "Next": "AARequestStateError"
+                    }
+                  ],
+                  "Default": "CopyFile"
+                },   
+                "AARequestStateError": {
+                  "Type": "Pass",
+                  "Result": {"Cause": "AA request record state is other than complete", "Error":     "AARequest State Error"},
+                  "Next": "PublishSNS"
+                },   
+                "CopyFile": {
+                  "Type": "Task",
+                  "Resource":  "${lambdaDoCopyFileArn}",
+                  "TimeoutSeconds": 300,
+                  "HeartbeatSeconds": 60,                  
+                    "ResultPath": "$.copyres",
+                  "Next": "PublishSuccessSNS",
+                  "Catch": [ {"ErrorEquals": [ "CopyFileError",  "States.TaskFailed" ],
+                                          "Next": "PublishSNS"} ]               
+                },
+                "PublishSNS": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sns:publish",                  
+                  "Parameters": {
+                    "TopicArn": "${SNSTopic}",
+                     "Subject.$": "$.Error",
+                    "Message.$": "$.Cause"
+                  },
+                  "End": true
+                },                
+                "PublishSuccessSNS": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sns:publish",                  
+                  "Parameters": {
+                    "TopicArn": "${SNSTopic}",
+                    "Subject.$": "$.AppName",
+                    "Message.$": "$.startDate"
+                  },
+                  "End": true
+                }                                           
+              }
+            }
+          - lambdaAANewRequestArn: !GetAtt [ SfdcNewAARequestFunction, Arn ]
+            lambdaSfdcLoginFunctionArn: !GetAtt [ SfdcLoginFunction, Arn ]
+            lambdaAAStatusArn: !GetAtt [ SfdcAARequestStatusFunction, Arn ]
+            lambdaDoCopyFileArn: !GetAtt [ AppAnalyticsDoCopyFunction, Arn ]
+            SNSTopic: !Ref SNSTopic
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]  
+
+Outputs:
+  AAStateMachine:
+      Description: AA  Step Functions State Machine ARN
+      Value: !Ref AAStateMachine
+  SNSTopic:
+      Description: SNS Topic ARN
+      Value: !Ref SNSTopic
